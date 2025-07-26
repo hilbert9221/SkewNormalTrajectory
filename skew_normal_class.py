@@ -608,6 +608,96 @@ def fast_cholesky_factorization(y, omega, delta):
     return ret
 
 
+def delta_given_Omega_and_alpha_with_normalization(Omega, alpha):
+    '''
+    delta is invariant to scale transformation.
+
+    Args:
+        Omega: correlation matrix
+        alpha: normalized alpha
+    '''
+    Omega_bar = get_Omega_bar(Omega)
+    denominator = (1 + compute_quadratic_form(alpha, Omega_bar, alpha)).sqrt()
+    delta = (Omega_bar @ alpha.unsqueeze(-1)).squeeze(-1) / denominator.unsqueeze(-1)
+    return delta
+
+
+def affine_skew_normal(xi, Omega, alpha, affine, constant):
+    '''
+    Args:
+        xi: [..., dim]
+        Omega: [..., dim, dim]
+        alpha: [..., dim]
+        affine: [..., dim_out, dim]
+        constant: [..., dim_out]
+    '''
+    xi_new = constant + (affine @ xi.unsqueeze(-1)).squeeze(-1)
+    Omega_new = affine @ Omega @ affine.transpose(-1, -2).contiguous()
+    delta = delta_given_Omega_and_alpha_with_normalization(Omega, alpha)
+    omega = batch_diag(Omega).sqrt()
+    omega_new = batch_diag(Omega_new).sqrt()
+    affine_omega_delta = (affine @ (omega * delta).unsqueeze(-1)).squeeze(-1)
+    inv_Omega_new = torch.linalg.inv(Omega_new)
+    denominator = (1 - compute_quadratic_form(affine_omega_delta, inv_Omega_new, affine_omega_delta)).sqrt()
+    alpha_new = (torch.diag_embed(omega_new) @ inv_Omega_new @ affine_omega_delta.unsqueeze(-1)).squeeze(-1) / denominator.unsqueeze(-1)
+    return xi_new, Omega_new, alpha_new
+
+
+def retrieve_skew_normal_parameters(logits, eps=1e-20, normalize=False):
+    xi = logits[..., :2]
+    if normalize:
+        sigma = logits[..., 2:4]
+        sigma = sigma - sigma.max(-1, keepdim=True)[0]
+        sigma = sigma.exp()
+    else:
+        sigma = F.softplus(logits[..., 2:4])
+        # sigma = logits[..., 2:4].exp()
+    rho = logits[..., 4].tanh().clamp(min=-1 + eps, max=1 - eps)
+    alpha = logits[..., 5:]
+    if normalize:
+        alpha = alpha.tanh()
+    omega = construct_covariance_matrix(sigma, rho, eps)
+    # omega = construct_nd_covariance_matrix(logits[..., 2:5])
+    return xi, omega, alpha
+
+
+def sample_skew_normal(xi, Omega, alpha, shape=torch.Size(), normalized=True):
+    '''
+    Args:
+        shape: tuple
+        xi: [..., dim]
+        Omega: [..., dim, dim]
+        alpha: [..., dim]
+
+    Return:
+        sample: [shape + xi.shape, ..., dim]
+    '''
+    # create augmented covariance matrix
+    dim = int(xi.shape[-1])
+    alpha = alpha.unsqueeze(-1)
+    omega = batch_diag(Omega).sqrt()
+    inv_omega_diag_mat = torch.diag_embed(1. / omega)
+    Omega_bar = inv_omega_diag_mat @ Omega @ inv_omega_diag_mat
+    scale = 1 / torch.sqrt(1 + alpha.transpose(-1, -2).contiguous() @ Omega_bar @ alpha)
+    delta = scale * Omega_bar @ alpha
+    omega_aug = torch.cat([delta, Omega_bar], dim=-1)
+    delta_aug = torch.cat([torch.ones(*xi.shape[:-1], 1, 1, device=xi.device), delta.transpose(-1, -2).contiguous()], dim=-1)
+    omega_aug = torch.cat([delta_aug, omega_aug], dim=-2)
+    noise = torch.randn(*(shape + xi.shape[:-1]), dim + 1).to(xi.device)
+    omega_sqrt = cholesky_with_exception(omega_aug)
+    noise = (omega_sqrt @ noise.unsqueeze(-1)).squeeze(-1)
+    x0 = noise[..., 0]
+    x = noise[..., 1:]
+    z = torch.zeros_like(x)
+    indicator = x0 > 0
+    z[indicator] = x[indicator]
+    z[~indicator] = - x[~indicator]
+    xi = left_expand(xi, len(shape))
+    omega = left_expand(omega, len(shape))
+    sample = xi + z * omega
+    return sample
+
+
 '''
 General Skew Normal
 '''
